@@ -1,0 +1,5 @@
+version: "2.0.0"
+description: Generic ESP-IDF component template
+url: https://github.com/pedrominatel/esp-components
+dependencies:
+  idf : ">=5.0"
