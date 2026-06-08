@@ -1,0 +1,507 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO., LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+#include "esp_err.h"
+#include "esp_log.h"
+#include "soc/soc_caps.h"
+#include "esp_console.h"
+#include "argtable3/argtable3.h"
+
+#include "esp_gmf_io.h"
+#include "esp_gmf_pipeline.h"
+#include "esp_gmf_pool.h"
+#include "esp_gmf_app_setup_peripheral.h"
+
+#include "esp_gmf_io_codec_dev.h"
+#include "esp_gmf_app_cli.h"
+#include "gmf_loader_setup_defaults.h"
+
+#if SOC_SDMMC_HOST_SUPPORTED == 1
+#define VOICE2FILE  (false)
+#endif  /* SOC_SDMMC_HOST_SUPPORTED == 1 */
+#if CONFIG_GMF_AI_AUDIO_WAKEUP_ENABLE == true || CONFIG_GMF_AI_AUDIO_INIT_WN == true
+#define WAKENET_ENABLE  (true)
+#else
+#define WAKENET_ENABLE  (false)
+#endif  /* CONFIG_GMF_AI_AUDIO_WAKEUP_ENABLE */
+#ifdef CONFIG_GMF_AI_AUDIO_VOICE_COMMAND_ENABLE
+#define VCMD_ENABLE  (true)
+#else
+#define VCMD_ENABLE  (false)
+#endif  /* CONFIG_GMF_AI_AUDIO_VOICE_COMMAND_ENABLE */
+#define QUIT_CMD_FOUND  (BIT0)
+
+#define BOARD_LYRAT_MINI  (0)
+#define BOARD_KORVO_2     (1)
+#define BOARD_XD_AIOT_C3  (2)
+#define BOARD_ESP_SPOT    (3)
+#define BOARD_P4_FUN_EV   (4)
+#define BOARD_S31_KORVO_1 (5)
+
+#define WITH_AFE    (CONFIG_GMF_AI_AUDIO_INIT_AFE)
+
+#if defined CONFIG_IDF_TARGET_ESP32S3
+#define AUDIO_BOARD (BOARD_KORVO_2)
+#elif defined CONFIG_IDF_TARGET_ESP32
+#define AUDIO_BOARD (BOARD_LYRAT_MINI)
+#elif defined CONFIG_IDF_TARGET_ESP32C3
+#define AUDIO_BOARD (BOARD_XD_AIOT_C3)
+#elif defined CONFIG_IDF_TARGET_ESP32C5
+#define AUDIO_BOARD (BOARD_ESP_SPOT)
+#elif defined CONFIG_IDF_TARGET_ESP32P4
+#define AUDIO_BOARD (BOARD_P4_FUN_EV)
+#elif defined CONFIG_IDF_TARGET_ESP32S31
+#define AUDIO_BOARD (BOARD_S31_KORVO_1)
+#endif  /* defined CONFIG_IDF_TARGET_ESP32S3 */
+
+#if AUDIO_BOARD == BOARD_KORVO_2
+#define ADC_I2S_CH          (2)
+#define ADC_I2S_BITS        (32)
+#define INPUT_CH_NUM        (4)
+#define INPUT_CH_BITS       (16) /* For board `ESP32-S3-Korvo-2`, the es7210 is configured as 32-bit,
+                                   2-channel mode to accommodate 16-bit, 4-channel data */
+#elif AUDIO_BOARD == BOARD_LYRAT_MINI
+#define ADC_I2S_CH          (2)
+#define ADC_I2S_BITS        (16)
+#define INPUT_CH_NUM        (ADC_I2S_CH)
+#define INPUT_CH_BITS       (ADC_I2S_BITS)
+#elif AUDIO_BOARD == BOARD_XD_AIOT_C3
+#define ADC_I2S_CH          (2)
+#define ADC_I2S_BITS        (16)
+#define INPUT_CH_NUM        (ADC_I2S_CH)
+#define INPUT_CH_BITS       (ADC_I2S_BITS)
+#elif AUDIO_BOARD == BOARD_ESP_SPOT
+#define ADC_I2S_CH          (2)
+#define ADC_I2S_BITS        (16)
+#define INPUT_CH_NUM        (ADC_I2S_CH)
+#define INPUT_CH_BITS       (ADC_I2S_BITS)
+#elif AUDIO_BOARD == BOARD_P4_FUN_EV
+#define ADC_I2S_CH          (2)
+#define ADC_I2S_BITS        (16)
+#define INPUT_CH_NUM        (ADC_I2S_CH)
+#define INPUT_CH_BITS       (ADC_I2S_BITS)
+#elif AUDIO_BOARD == BOARD_S31_KORVO_1
+#define ADC_I2S_CH          (4)
+#define ADC_I2S_BITS        (16)
+#define INPUT_CH_NUM        (ADC_I2S_CH)
+#define INPUT_CH_BITS       (ADC_I2S_BITS)
+#endif  /* AUDIO_BOARD == BOARD_KORVO_2 */
+
+#if WITH_AFE == true
+#include "esp_gmf_afe.h"
+#else
+#include "esp_gmf_wn.h"
+#endif  /* WITH_AFE == true */
+
+static const char *TAG = "AI_AUDIO_WWE";
+
+#if WITH_AFE == true
+static bool speeching = false;
+static bool wakeup    = false;
+#endif  /* WITH_AFE == true */
+static EventGroupHandle_t g_event_group = NULL;
+#if WITH_AFE == true
+static esp_gmf_element_handle_t g_afe   = NULL;
+#endif  /* WITH_AFE == true */
+
+#if VOICE2FILE == true && WITH_AFE == true
+#define VOICE2FILE_QUEUE_LEN   (16)
+#define VOICE2FILE_TASK_STACK  (3072)
+#define VOICE2FILE_TASK_PRIO   (4)
+
+/**
+ * @brief  Message to writer task.
+ */
+typedef struct {
+    enum {
+        SAVE_TO_FILE,
+        QUIT_TASK,
+    } id;           /**< Message ID. */
+    uint8_t *data;  /**< Pointer to copied audio data; NULL for state-only (e.g. VAD_END). */
+    int      len;   /**< Length in bytes; < 0 means poison (task exit). */
+} voice2file_msg_t;
+
+static QueueHandle_t voice2file_queue = NULL;
+
+static void voice2file_task(void *arg)
+{
+#define MAX_FNAME_LEN  (50)
+    FILE *fp = NULL;
+    int fcnt = 0;
+    voice2file_msg_t msg;
+
+    while (xQueueReceive(voice2file_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (msg.id == QUIT_TASK) {
+            if (fp) {
+                fclose(fp);
+                fp = NULL;
+            }
+            if (msg.data) {
+                esp_gmf_oal_free(msg.data);
+            }
+            break;
+        }
+        if (speeching && msg.id == SAVE_TO_FILE) {
+            if (msg.data && msg.len > 0) {
+                if (!fp) {
+                    char fname[MAX_FNAME_LEN] = {0};
+                    snprintf(fname, MAX_FNAME_LEN - 1, "/sdcard/16k_16bit_1ch_%d.pcm", fcnt++);
+                    fp = fopen(fname, "wb");
+                    if (!fp) {
+                        ESP_LOGE(TAG, "Open failed");
+                    }
+                }
+                if (fp) {
+                    fwrite(msg.data, (size_t)msg.len, 1, fp);
+                }
+            }
+        } else {
+            if (fp) {
+                ESP_LOGI(TAG, "File closed");
+                fclose(fp);
+                fp = NULL;
+            }
+        }
+        if (msg.data) {
+            esp_gmf_oal_free(msg.data);
+        }
+    }
+    while (xQueueReceive(voice2file_queue, &msg, 0) == pdTRUE) {
+        if (msg.data) {
+            esp_gmf_oal_free(msg.data);
+        }
+    }
+    vQueueDelete(voice2file_queue);
+    voice2file_queue = NULL;
+    vTaskDelete(NULL);
+}
+#endif  /* VOICE2FILE == true && WITH_AFE == true */
+
+static esp_err_t _pipeline_event(esp_gmf_event_pkt_t *event, void *ctx)
+{
+    ESP_LOGI(TAG, "CB: RECV Pipeline EVT: el:%s-%p, type:%d, sub:%s, payload:%p, size:%d,%p",
+             OBJ_GET_TAG(event->from), event->from, event->type, esp_gmf_event_get_state_str(event->sub),
+             event->payload, event->payload_size, ctx);
+    return 0;
+}
+
+#if WITH_AFE == true
+void esp_gmf_afe_event_cb(esp_gmf_obj_handle_t obj, esp_gmf_afe_evt_t *event, void *user_data)
+{
+    switch (event->type) {
+        case ESP_GMF_AFE_EVT_WAKEUP_START: {
+            wakeup = true;
+#if WAKENET_ENABLE == true && VCMD_ENABLE == true
+            esp_gmf_afe_vcmd_detection_cancel(obj);
+            esp_gmf_afe_vcmd_detection_begin(obj);
+#endif  /* WAKENET_ENABLE == true && VCMD_ENABLE == true */
+            if (event->event_data) {
+                esp_gmf_afe_wakeup_info_t *info = event->event_data;
+                ESP_LOGI(TAG, "WAKEUP_START [%d : %d]", info->wake_word_index, info->wakenet_model_index);
+            } else {
+                ESP_LOGI(TAG, "WAKEUP_START");
+            }
+            break;
+        }
+        case ESP_GMF_AFE_EVT_WAKEUP_END: {
+            wakeup = false;
+#if WAKENET_ENABLE == true && VCMD_ENABLE == true
+            esp_gmf_afe_vcmd_detection_cancel(obj);
+#endif  /* WAKENET_ENABLE == true && VCMD_ENABLE == true */
+            ESP_LOGI(TAG, "WAKEUP_END");
+            break;
+        }
+        case ESP_GMF_AFE_EVT_VAD_START: {
+#if WAKENET_ENABLE != true && VCMD_ENABLE == true
+            esp_gmf_afe_vcmd_detection_cancel(obj);
+            esp_gmf_afe_vcmd_detection_begin(obj);
+#endif  /* WAKENET_ENABLE != true && VCMD_ENABLE == true */
+            speeching = true;
+            ESP_LOGI(TAG, "VAD_START");
+            break;
+        }
+        case ESP_GMF_AFE_EVT_VAD_END: {
+#if WAKENET_ENABLE != true && VCMD_ENABLE == true
+            esp_gmf_afe_vcmd_detection_cancel(obj);
+#endif  /* WAKENET_ENABLE != true && VCMD_ENABLE == true */
+            speeching = false;
+            ESP_LOGI(TAG, "VAD_END");
+            break;
+        }
+        case ESP_GMF_AFE_EVT_VCMD_DECT_TIMEOUT: {
+            ESP_LOGI(TAG, "VCMD_DECT_TIMEOUT");
+            break;
+        }
+        default: {
+            esp_gmf_afe_vcmd_info_t *info = event->event_data;
+            ESP_LOGW(TAG, "Command %d, phrase_id %d, prob %f, str: %s",
+                     event->type, info->phrase_id, info->prob, info->str);
+            break;
+        }
+    }
+}
+#else
+static void esp_gmf_wn_event_cb(esp_gmf_obj_handle_t obj, int32_t trigger_ch, void *user_ctx)
+{
+    static int32_t cnt = 1;
+    ESP_LOGI(TAG, "WWE detected on channel %" PRIi32 ", cnt: %" PRIi32, trigger_ch, cnt++);
+    if (cnt >= 10) {
+        xEventGroupSetBits(g_event_group, QUIT_CMD_FOUND);
+    }
+}
+#endif  /* WITH_AFE == true */
+
+static void voice_2_file(uint8_t *buffer, int len)
+{
+#if VOICE2FILE == true && WITH_AFE == true
+    if (!voice2file_queue) {
+        return;
+    }
+    uint8_t *copy = NULL;
+    if (len > 0 && buffer) {
+        copy = esp_gmf_oal_malloc(len);
+        if (!copy) {
+            ESP_LOGE(TAG, "voice2file: malloc failed");
+            return;
+        }
+        memcpy(copy, buffer, (size_t)len);
+    }
+    voice2file_msg_t msg = {
+        .data = copy,
+        .len = len,
+    };
+    if (xQueueSend(voice2file_queue, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "voice2file: queue full, drop");
+        if (copy) {
+            esp_gmf_oal_free(copy);
+        }
+    }
+#endif  /* VOICE2FILE == true && WITH_AFE == true */
+}
+
+static esp_gmf_err_io_t outport_acquire_write(void *handle, esp_gmf_payload_t *load, int wanted_size, int block_ticks)
+{
+    ESP_LOGD(TAG, "Acquire write");
+    return ESP_GMF_IO_OK;
+}
+
+static esp_gmf_err_io_t outport_release_write(void *handle, esp_gmf_payload_t *load, int block_ticks)
+{
+    ESP_LOGD(TAG, "Release write");
+    voice_2_file(load->buf, load->valid_size);
+    return ESP_GMF_IO_OK;
+}
+
+#if WITH_AFE == true
+static struct {
+    struct arg_int *keep;
+    struct arg_end *end;
+} keep_args;
+
+static int keep_awake(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&keep_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, keep_args.end, argv[0]);
+        return ESP_FAIL;
+    }
+    if (g_afe) {
+        esp_gmf_afe_keep_awake(g_afe, keep_args.keep->ival[0]);
+        printf("Keep awake: %d\n", keep_args.keep->ival[0]);
+    } else {
+        ESP_LOGE(TAG, "AFE not found");
+    }
+    return ESP_OK;
+}
+
+static struct {
+    struct arg_str *cmd;
+    struct arg_end *end;
+} trigger_args;
+
+static int trigger(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&trigger_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, trigger_args.end, argv[0]);
+        return ESP_FAIL;
+    }
+    if (g_afe) {
+        if (strcmp(trigger_args.cmd->sval[0], "wakeup") == 0) {
+            esp_gmf_afe_trigger_wakeup(g_afe);
+        } else if (strcmp(trigger_args.cmd->sval[0], "sleep") == 0) {
+            esp_gmf_afe_trigger_sleep(g_afe);
+        }
+    }
+    return 0;
+}
+#endif  /* WITH_AFE == true */
+
+static int quit(int argc, char **argv)
+{
+    xEventGroupSetBits(g_event_group, QUIT_CMD_FOUND);
+    return 0;
+}
+
+static void wwe_cmds_register(void)
+{
+#if WITH_AFE == true
+    esp_console_cmd_t cmd_keep = {
+        .command = "keep",
+        .help = "keep awake",
+        .hint = NULL,
+        .func = &keep_awake,
+        .argtable = &keep_args,
+    };
+    keep_args.keep = arg_int0(NULL, NULL, "<0 - 1>", "Keep awake");
+    keep_args.end = arg_end(1);
+    esp_console_cmd_register(&cmd_keep);
+
+    esp_console_cmd_t cmd_trigger_wakeup = {
+        .command = "trigger",
+        .help = "trigger wakeup or sleep",
+        .hint = NULL,
+        .func = &trigger,
+        .argtable = &trigger_args,
+    };
+    trigger_args.cmd = arg_str0(NULL, NULL, "<wakeup|sleep>", "Trigger wakeup or sleep");
+    trigger_args.end = arg_end(1);
+    esp_console_cmd_register(&cmd_trigger_wakeup);
+#endif  /* WITH_AFE == true */
+
+    esp_console_cmd_t cmd_quit = {
+        .command = "quit",
+        .help = "quit",
+        .hint = NULL,
+        .func = &quit,
+        .argtable = NULL,
+    };
+    esp_console_cmd_register(&cmd_quit);
+}
+
+void app_main(void)
+{
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_gmf_app_codec_info_t codec_info = ESP_GMF_APP_CODEC_INFO_DEFAULT();
+    codec_info.record_info.sample_rate = 16000;
+    codec_info.record_info.channel = ADC_I2S_CH;
+    codec_info.record_info.bits_per_sample = ADC_I2S_BITS;
+    codec_info.play_info.sample_rate = codec_info.record_info.sample_rate;
+    esp_gmf_app_setup_codec_dev(&codec_info);
+#if VOICE2FILE == true && WITH_AFE == true
+    void *sdcard_handle = NULL;
+    esp_gmf_app_setup_sdcard(&sdcard_handle);
+    voice2file_queue = xQueueCreate(VOICE2FILE_QUEUE_LEN, sizeof(voice2file_msg_t));
+    if (voice2file_queue) {
+        xTaskCreate(voice2file_task, "voice2file", VOICE2FILE_TASK_STACK, NULL,
+                    VOICE2FILE_TASK_PRIO, NULL);
+    }
+#endif  /* VOICE2FILE == true && WITH_AFE == true */
+    g_event_group = xEventGroupCreate();
+
+    esp_gmf_pool_handle_t pool = NULL;
+    esp_gmf_pool_init(&pool);
+    gmf_loader_setup_all_defaults(pool);
+
+    esp_gmf_pipeline_handle_t pipe = NULL;
+    esp_gmf_task_handle_t task = NULL;
+#if WITH_AFE == true
+    const char *name[] = {"ai_afe"};
+#else
+    const char *name[] = {"ai_wn"};
+#endif  /* WITH_AFE == true */
+    esp_gmf_pool_new_pipeline(pool, "io_codec_dev", name, sizeof(name) / sizeof(char *), NULL, &pipe);
+    if (pipe == NULL) {
+        ESP_LOGE(TAG, "There is no pipeline");
+        goto __quit;
+    }
+    esp_gmf_io_codec_dev_set_dev(ESP_GMF_PIPELINE_GET_IN_INSTANCE(pipe), esp_gmf_app_get_record_handle());
+#if WITH_AFE == true
+    esp_gmf_pipeline_get_el_by_name(pipe, "ai_afe", &g_afe);
+    esp_gmf_afe_set_event_cb(g_afe, esp_gmf_afe_event_cb, NULL);
+#else
+    esp_gmf_element_handle_t wn = NULL;
+    esp_gmf_pipeline_get_el_by_name(pipe, "ai_wn", &wn);
+    esp_gmf_wn_set_detect_cb(wn, esp_gmf_wn_event_cb, NULL);
+#endif  /* WITH_AFE == true */
+    esp_gmf_port_handle_t outport = NEW_ESP_GMF_PORT_OUT_BYTE(outport_acquire_write,
+                                                              outport_release_write,
+                                                              NULL,
+                                                              NULL,
+                                                              2048,
+                                                              100);
+    esp_gmf_pipeline_reg_el_port(pipe, name[0], ESP_GMF_IO_DIR_WRITER, outport);
+
+    esp_gmf_info_sound_t info = {
+        .sample_rates = 16000,
+        .channels = INPUT_CH_NUM,
+        .bits = INPUT_CH_BITS,
+    };
+    esp_gmf_pipeline_report_info(pipe, ESP_GMF_INFO_SOUND, &info, sizeof(info));
+
+    esp_gmf_task_cfg_t cfg = DEFAULT_ESP_GMF_TASK_CONFIG();
+    cfg.ctx = NULL;
+    cfg.cb = NULL;
+    cfg.thread.core = 0;
+    cfg.thread.prio = 5;
+    cfg.thread.stack = 5120;
+    esp_gmf_task_init(&cfg, &task);
+    esp_gmf_pipeline_bind_task(pipe, task);
+    esp_gmf_pipeline_loading_jobs(pipe);
+    esp_gmf_pipeline_set_event(pipe, _pipeline_event, NULL);
+    esp_gmf_pipeline_run(pipe);
+
+    esp_gmf_app_cli_init("Audio >", wwe_cmds_register);
+
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(g_event_group, QUIT_CMD_FOUND, pdTRUE, pdFALSE, portMAX_DELAY);
+        if (bits & QUIT_CMD_FOUND) {
+            ESP_LOGI(TAG, "Quit command found, stopping pipeline");
+            break;
+        }
+    }
+
+__quit:
+    if (pipe) {
+        esp_gmf_pipeline_stop(pipe);
+        esp_gmf_pipeline_destroy(pipe);
+        pipe = NULL;
+    }
+    if (task) {
+        esp_gmf_task_deinit(task);
+        task = NULL;
+    }
+    if (pool) {
+        gmf_loader_teardown_all_defaults(pool);
+        esp_gmf_pool_deinit(pool);
+        pool = NULL;
+    }
+    esp_gmf_app_teardown_codec_dev();
+#if VOICE2FILE == true && WITH_AFE == true
+    if (voice2file_queue) {
+        voice2file_msg_t msg = {.id = QUIT_TASK};
+        xQueueSend(voice2file_queue, &msg, portMAX_DELAY);
+    }
+    if (sdcard_handle) {
+        esp_gmf_app_teardown_sdcard(sdcard_handle);
+        sdcard_handle = NULL;
+    }
+#endif  /* VOICE2FILE == true && WITH_AFE == true */
+    if (g_event_group) {
+        vEventGroupDelete(g_event_group);
+        g_event_group = NULL;
+    }
+    ESP_LOGW(TAG, "Wake word engine demo finished");
+}
