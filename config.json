@@ -1,0 +1,13 @@
+{
+  "title": "ESP Workshops",
+  "welcome": "welcome.md",
+  "examples": "Workshops",
+  "settings": {
+    "fixed": {
+      "idfweb.idf.release": "v6.1",
+      "idfweb.targets.visible": ["esp32c5", "esp32s31"],
+      "idfweb.targets.default": "esp32c5",
+      "idfweb.welcome.folders": false
+    }
+  }
+}
