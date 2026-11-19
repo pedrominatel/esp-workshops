@@ -82,3 +82,7 @@ XUNIT_RESULT*.xml
 
 # Vale
 .vale/styles/*
+
+# Nested source checkouts used by the AI workshop
+/workshop-ai/assignments/part-2/esp-dev-kits/
+/workshop-ai/assignments/part-2/skainet/esp-skainet/
