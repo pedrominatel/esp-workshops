@@ -2,6 +2,7 @@
   "title": "ESP Workshops",
   "welcome": "welcome.md",
   "examples": "Workshops",
+  "start": "builtin/workshop",
   "settings": {
     "fixed": {
       "idfweb.idf.release": "v6.1",
