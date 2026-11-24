@@ -1,3 +1,0 @@
-dependencies:
-  esp32_s3_eye:
-    version: '*'
